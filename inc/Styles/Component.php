@@ -1,0 +1,460 @@
+<?php
+/**
+ * Bonn\GrowModo\Styles\Component class
+ *
+ * Handles enqueueing, preloading, and conditional loading of CSS stylesheets.
+ *
+ * @package bonn_growmodo
+ *
+ * @css-file assets/css/src/global.css        Main stylesheet entry point (imports all partials)
+ * @css-file assets/css/src/content.css       Post/page content styles (conditional)
+ * @css-file assets/css/src/sidebar.css       Sidebar styles (conditional - when sidebar active)
+ * @css-file assets/css/src/comments.css      Comment section styles (conditional)
+ * @css-file assets/css/src/widgets.css       Widget styles
+ * @css-file assets/css/src/front-page.css    Front page specific styles (conditional)
+ *
+ * @config-key dev.styles                     Style processing configuration
+ * @config-key dev.styles.preload             Files to preload
+ *
+ * @see get_css_files() for conditional loading logic
+ */
+
+namespace Bonn\GrowModo\Styles;
+
+use Bonn\GrowModo\Component_Interface;
+use Bonn\GrowModo\Templating_Component_Interface;
+use Bonn\GrowModo\Asset_Provider;
+use Bonn\GrowModo\Versioning_Trait;
+use Bonn\GrowModo\Performance\Component as Performance_Component;
+use function Bonn\GrowModo\get_asset_content;
+use function Bonn\GrowModo\bonn_growmodo;
+use function Bonn\GrowModo\bonn_growmodo_theme;
+use function add_action;
+use function add_filter;
+use function wp_enqueue_style;
+use function wp_register_style;
+use function wp_style_add_data;
+use function get_theme_file_uri;
+use function get_theme_file_path;
+use function wp_styles;
+use function esc_attr;
+use function esc_url;
+use function add_editor_style;
+use function wp_style_is;
+use function _doing_it_wrong;
+use function esc_html;
+use function wp_print_styles;
+use function post_password_required;
+use function is_singular;
+use function comments_open;
+use function get_comments_number;
+use function apply_filters;
+use function add_query_arg;
+
+/**
+ * Class for managing stylesheets.
+ *
+ * Exposes template tags:
+ * * `bonn_growmodo()->print_styles()`
+ */
+class Component implements Component_Interface, Templating_Component_Interface {
+
+	use Versioning_Trait;
+
+	/**
+	 * Associative array of CSS files, as $handle => $data pairs.
+	 * $data must be an array with keys 'file' (file path relative to 'assets/css' directory), and optionally 'global'
+	 * (whether the file should immediately be enqueued instead of just being registered) and 'preload_callback'
+	 * (callback function determining whether the file should be preloaded for the current request).
+	 *
+	 * Do not access this property directly, instead use the `get_css_files()` method.
+	 *
+	 * @var array
+	 */
+	protected $css_files;
+
+	/**
+	 * Base URI for CSS files.
+	 *
+	 * @var string
+	 */
+	protected string $css_uri;
+
+	/**
+	 * Base directory for CSS files.
+	 *
+	 * @var string
+	 */
+	protected string $css_dir;
+
+	/**
+	 * Static cache for processed critical CSS.
+	 *
+	 * @var array
+	 */
+	protected static array $processed_critical_css = array();
+
+	/**
+	 * Gets the unique identifier for the theme component.
+	 *
+	 * @return string Component slug.
+	 */
+	public function get_slug(): string {
+		return 'styles';
+	}
+
+	/**
+	 * Adds the action and filter hooks to integrate with WordPress.
+	 */
+	public function initialize() {
+		$this->css_uri = get_theme_file_uri( '/assets/css/' );
+		$this->css_dir = get_theme_file_path( '/assets/css/' );
+
+		add_action( 'wp_enqueue_scripts', array( $this, 'action_enqueue_styles' ) );
+		add_action( 'wp_head', array( $this, 'action_preload_styles' ) );
+		add_action( 'wp_head', array( $this, 'action_inline_critical_css' ), 1 );
+		add_action( 'after_setup_theme', array( $this, 'action_add_editor_styles' ) );
+	}
+
+	/**
+	 * Gets template tags to expose as methods on the Template_Tags class instance, accessible through `bonn_growmodo()`.
+	 *
+	 * @return array Associative array of $method_name => $callback_info pairs. Each $callback_info must either be
+	 *               a callable or an array with key 'callable'. This approach is used to reserve the possibility of
+	 *               adding support for further arguments in the future.
+	 */
+	public function template_tags(): array {
+		return array(
+			'print_styles' => array( $this, 'print_styles' ),
+		);
+	}
+
+	/**
+	 * Registers or enqueues stylesheets.
+	 *
+	 * Stylesheets that are global are enqueued. All other stylesheets are only registered, to be enqueued later.
+	 */
+	public function action_enqueue_styles() {
+		$preloading_styles_enabled = $this->preloading_styles_enabled();
+
+		$css_files = $this->get_css_files();
+		foreach ( $css_files as $handle => $data ) {
+			// Skip if this is an inline style.
+			if ( ! empty( $data['inline'] ) ) {
+				continue;
+			}
+
+			// Skip if condition is not met.
+			if ( ! empty( $data['condition'] ) && is_callable( $data['condition'] ) && ! call_user_func( $data['condition'] ) ) {
+				continue;
+			}
+
+			// Ensure dependencies are registered.
+			foreach ( $data['deps'] as $dep ) {
+				if ( ! wp_style_is( $dep, 'registered' ) ) {
+					wp_register_style( $dep, false, array(), $this->get_version() );
+				}
+			}
+
+			/*
+			 * Enqueue global stylesheets immediately and register the other ones for later use
+			 * (unless preloading stylesheets is disabled, in which case stylesheets should be immediately
+			 * enqueued based on whether they are necessary for the page content).
+			 */
+			$global_style         = $data['global'];
+			$preloading_available = is_callable( $data['preload_callback'] ) && call_user_func( $data['preload_callback'] );
+
+			if ( $global_style || ( ! $preloading_styles_enabled && $preloading_available ) ) {
+				wp_enqueue_style( $handle, $data['src'], $data['deps'], $data['version'], $data['media'] );
+			} else {
+				wp_register_style( $handle, $data['src'], $data['deps'], $data['version'], $data['media'] );
+			}
+
+			wp_style_add_data( $handle, 'precache', true );
+		}
+	}
+
+	/**
+	 * Preloads in-body stylesheets depending on what templates are being used.
+	 *
+	 * Only stylesheets that have a 'preload_callback' provided will be considered. If that callback evaluates to true
+	 * for the current request, the stylesheet will be preloaded.
+	 *
+	 * Preloading is disabled when AMP is active, as AMP injects the stylesheets inline.
+	 *
+	 * @link https://developer.mozilla.org/en-US/docs/Web/HTML/Preloading_content
+	 */
+	public function action_preload_styles() {
+
+		// If preloading styles is disabled, return early.
+		if ( ! $this->preloading_styles_enabled() ) {
+			return;
+		}
+
+		$wp_styles = wp_styles();
+
+		$css_files = $this->get_css_files();
+		foreach ( $css_files as $handle => $data ) {
+
+			// Handle resource hints (preload) from manifest.
+			if ( ! empty( $data['preload'] ) ) {
+				// Verify condition if provided.
+				if ( ! empty( $data['condition'] ) && is_callable( $data['condition'] ) && ! call_user_func( $data['condition'] ) ) {
+					continue;
+				}
+
+				echo '<link rel="preload" id="' . esc_attr( $handle ) . '-preload" href="' . esc_url( $data['src'] ) . '" as="style">';
+				echo "\n";
+				continue;
+			}
+
+			// Skip if stylesheet not registered.
+			if ( ! isset( $wp_styles->registered[ $handle ] ) ) {
+				continue;
+			}
+
+			// Skip if no preload callback provided.
+			if ( ! is_callable( $data['preload_callback'] ) ) {
+				continue;
+			}
+
+			// Skip if preloading is not necessary for this request.
+			if ( ! call_user_func( $data['preload_callback'] ) ) {
+				continue;
+			}
+
+			$preload_uri = $wp_styles->registered[ $handle ]->src . '?ver=' . $wp_styles->registered[ $handle ]->ver;
+
+			echo '<link rel="preload" id="' . esc_attr( $handle ) . '-preload" href="' . esc_url( $preload_uri ) . '" as="style" onload="this.rel=\'stylesheet\'">';
+			echo "\n";
+		}
+	}
+
+	/**
+	 * Inlines critical CSS stylesheets directly into the head.
+	 */
+	public function action_inline_critical_css() {
+		$css_files = $this->get_css_files();
+
+		foreach ( $css_files as $handle => $data ) {
+			if ( empty( $data['inline'] ) ) {
+				continue;
+			}
+
+			// Verify condition if provided.
+			if ( ! empty( $data['condition'] ) && is_callable( $data['condition'] ) && ! call_user_func( $data['condition'] ) ) {
+				continue;
+			}
+
+			if ( isset( self::$processed_critical_css[ $handle ] ) ) {
+				// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+				echo self::$processed_critical_css[ $handle ];
+				continue;
+			}
+
+			$css_content = get_asset_content( $data['path'] );
+			if ( $css_content ) {
+				$output = '<style id="wprig-critical-' . esc_attr( $handle ) . '-css">';
+				// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+				$output .= str_replace( '</style>', '', $css_content );
+				$output .= '</style>';
+				$output .= "\n";
+
+				self::$processed_critical_css[ $handle ] = $output;
+				// phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+				echo $output;
+			}
+		}
+	}
+
+	/**
+	 * Enqueues WordPress theme styles for the editor.
+	 */
+	public function action_add_editor_styles() {
+
+		// Enqueue block editor stylesheet.
+		add_editor_style( 'assets/css/editor/editor-styles.min.css' );
+	}
+
+	/**
+	 * Prints stylesheet link tags directly.
+	 *
+	 * This should be used for stylesheets that aren't global and thus should only be loaded if the HTML markup
+	 * they are responsible for is actually present. Template parts should use this method when the related markup
+	 * requires a specific stylesheet to be loaded. If preloading stylesheets is disabled, this method will not do
+	 * anything.
+	 *
+	 * If the `<link>` tag for a given stylesheet has already been printed, it will be skipped.
+	 *
+	 * @param string ...$handles One or more stylesheet handles.
+	 */
+	public function print_styles( string ...$handles ) {
+
+		// If preloading styles is disabled (and thus they have already been enqueued), return early.
+		if ( ! $this->preloading_styles_enabled() ) {
+			return;
+		}
+
+		$css_files = $this->get_css_files();
+		$handles   = array_filter(
+			$handles,
+			function ( $handle ) use ( $css_files ) {
+				$is_valid = isset( $css_files[ $handle ] ) && ! $css_files[ $handle ]['global'];
+				if ( ! $is_valid ) {
+					/* translators: %s: stylesheet handle */
+					_doing_it_wrong( __CLASS__ . '::print_styles()', esc_html( sprintf( __( 'Invalid theme stylesheet handle: %s', 'bonn-growmodo' ), $handle ) ), 'Bonn GrowModo 2.0.0' );
+				}
+				return $is_valid;
+			}
+		);
+
+		if ( array() === $handles ) {
+			return;
+		}
+
+		wp_print_styles( $handles );
+	}
+
+	/**
+	 * Determines whether to preload stylesheets and inject their link tags directly within the page content.
+	 *
+	 * Using this technique generally improves performance, however may not be preferred under certain circumstances.
+	 * {@see 'bonn_growmodo_preloading_styles_enabled'} filter can be used to tweak the return value.
+	 *
+	 * @return bool True if preloading stylesheets and injecting them is enabled, false otherwise.
+	 */
+	protected function preloading_styles_enabled(): bool {
+
+		/**
+		 * Filters whether to preload stylesheets and inject their link tags within the page content.
+		 *
+		 * @param bool $preloading_styles_enabled Whether preloading stylesheets and injecting them is enabled.
+		 */
+		return apply_filters( 'bonn_growmodo_preloading_styles_enabled', true );
+	}
+
+	/**
+	 * Gets all CSS files.
+	 *
+	 * @return array Associative array of $handle => $data pairs.
+	 */
+	protected function get_css_files(): array {
+		if ( is_array( $this->css_files ) ) {
+			return $this->css_files;
+		}
+
+		$css_files = array(
+			'bonn-growmodo-global'     => array(
+				'file'   => 'global.min.css',
+				'global' => true,
+			),
+			'bonn-growmodo-comments'   => array(
+				'file'             => 'comments.min.css',
+				'preload_callback' => function () {
+					return ! post_password_required() && is_singular() && ( comments_open() || get_comments_number() );
+				},
+			),
+			'bonn-growmodo-content'    => array(
+				'file'             => 'content.min.css',
+				'preload_callback' => '__return_true',
+			),
+			'bonn-growmodo-sidebar'    => array(
+				'file'             => 'sidebar.min.css',
+				'preload_callback' => function () {
+					return bonn_growmodo()->is_primary_sidebar_active();
+				},
+			),
+			'bonn-growmodo-widgets'    => array(
+				'file'             => 'widgets.min.css',
+				'preload_callback' => function () {
+					return bonn_growmodo()->is_primary_sidebar_active();
+				},
+			),
+			'bonn-growmodo-front-page' => array(
+				'file'             => 'front-page.min.css',
+				'preload_callback' => function () {
+					global $template;
+					$name = basename( (string) $template );
+					return in_array( $name, array( 'front-page.php', 'page-about.php', 'archive-property.php', 'single-property.php' ), true );
+				},
+			),
+			'bonn-growmodo-about-page' => array(
+				'file'             => 'about-page.min.css',
+				'preload_callback' => function () {
+					global $template;
+					return 'page-about.php' === basename( (string) $template );
+				},
+			),
+			'bonn-growmodo-property-single' => array(
+				'file'             => 'property-single.min.css',
+				'preload_callback' => function () {
+					return is_singular( 'property' ) || is_post_type_archive( 'property' );
+				},
+			),
+			'bonn-growmodo-property-archive' => array(
+				'file'             => 'property-archive.min.css',
+				'preload_callback' => function () {
+					return is_post_type_archive( 'property' );
+				},
+			),
+		);
+
+		// Aggregate manifests from components implementing Asset_Provider.
+		$css_files = array_merge( $css_files, bonn_growmodo_theme()->get_asset_manifests( 'styles' ) );
+
+		/**
+		 * Filters default CSS files.
+		 *
+		 * @param array $css_files Associative array of CSS files, as $handle => $data pairs.
+		 *                         $data must be an array with keys 'file' (file path relative to 'assets/css'
+		 *                         directory), and optionally 'global' (whether the file should immediately be
+		 *                         enqueued instead of just being registered) and 'preload_callback' (callback)
+		 *                         function determining whether the file should be preloaded for the current request).
+		 */
+		$css_files = apply_filters( 'bonn_growmodo_css_files', $css_files );
+
+		$this->css_files = array();
+		foreach ( $css_files as $handle => $data ) {
+			if ( is_string( $data ) ) {
+				$data = array( 'file' => $data );
+			}
+
+			if ( empty( $data['file'] ) ) {
+				continue;
+			}
+
+			$this->css_files[ $handle ] = array_merge(
+				array(
+					'global'           => false,
+					'preload_callback' => null,
+					'media'            => 'all',
+					'deps'             => array(),
+					'strategy'         => null,
+				),
+				$data
+			);
+
+			$file = bonn_growmodo()->get_asset_file( $this->css_files[ $handle ]['file'], 'style' );
+
+			$this->css_files[ $handle ]['file']    = $file;
+			$this->css_files[ $handle ]['src']     = $this->css_uri . $file;
+			$this->css_files[ $handle ]['path']    = $this->css_dir . $file;
+			$this->css_files[ $handle ]['version'] = bonn_growmodo()->get_asset_version( $this->css_dir . $file );
+
+			// Process critical strategy if provided.
+			if ( ! empty( $this->css_files[ $handle ]['strategy'] ) ) {
+				$performance = bonn_growmodo_theme()->component( 'performance' );
+				if ( $performance instanceof Performance_Component ) {
+					$strategy = $performance->get_strategy( $this->css_files[ $handle ]['strategy'] );
+					if ( $strategy instanceof \Bonn\GrowModo\Performance\Critical_Strategy_Interface ) {
+						$should_inline                        = $strategy->should_inline( $handle, $this->css_files[ $handle ] );
+						$this->css_files[ $handle ]['inline'] = $should_inline;
+						$this->css_files[ $handle ]['global'] = ! $should_inline;
+					}
+				}
+			}
+		}
+
+		return $this->css_files;
+	}
+}

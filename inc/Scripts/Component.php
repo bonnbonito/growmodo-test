@@ -1,0 +1,299 @@
+<?php
+/**
+ * Bonn\GrowModo\Scripts\Component class
+ *
+ * Handles enqueueing and async/defer loading of JavaScript files.
+ *
+ * @package bonn_growmodo
+ *
+ * @js-file assets/js/src/global.ts      Global scripts loaded on all pages
+ * @js-file assets/js/src/navigation.ts  Navigation menu behavior (mobile toggle, dropdowns)
+ *
+ * @config-key dev.debug.scripts         Script debugging configuration
+ *
+ * @see get_js_files() for script registration
+ */
+
+namespace Bonn\GrowModo\Scripts;
+
+use Bonn\GrowModo\Component_Interface;
+use Bonn\GrowModo\Templating_Component_Interface;
+use Bonn\GrowModo\Asset_Provider;
+use Bonn\GrowModo\Versioning_Trait;
+use function Bonn\GrowModo\bonn_growmodo;
+use function Bonn\GrowModo\bonn_growmodo_theme;
+use function add_action;
+use function add_filter;
+use function wp_enqueue_script;
+use function wp_register_script;
+use function wp_script_add_data;
+use function get_theme_file_uri;
+use function get_theme_file_path;
+use function _doing_it_wrong;
+use function esc_html;
+use function wp_print_scripts;
+use function apply_filters;
+use function wp_scripts;
+use function esc_attr;
+
+/**
+ * Class for managing javascript files.
+ *
+ * Exposes template tags:
+ * * `bonn_growmodo()->print_scripts()`
+ */
+class Component implements Component_Interface, Templating_Component_Interface {
+
+	use Versioning_Trait;
+
+	/**
+	 * Associative array of JavaScript files, as $handle => $data pairs.
+	 * $data must be an array with keys:
+	 * - 'file' (file path relative to 'assets/js' directory) - required
+	 * - 'global' (whether the file should immediately be enqueued instead of just being registered)
+	 * - 'loading' (whether the file should be loaded 'async' or 'defer')
+	 * - 'footer' (whether the file should be loaded in the footer)
+	 * - 'deps' (array of dependencies)
+	 * - 'localize' (array of variables to inject with wp_localize_scripts)
+	 *
+	 * Not currently implemented
+	 * 'preload_callback'
+	 * (callback function determining whether the file should be preloaded for the current request).
+	 *
+	 * Do not access this property directly, instead use the `get_js_files()` method.
+	 *
+	 * @var array
+	 */
+	protected $js_files;
+
+	/**
+	 * Base URI for JS files.
+	 *
+	 * @var string
+	 */
+	protected string $js_uri;
+
+	/**
+	 * Base directory for JS files.
+	 *
+	 * @var string
+	 */
+	protected string $js_dir;
+
+	/**
+	 * Gets the unique identifier for the theme component.
+	 *
+	 * @return string Component slug.
+	 */
+	public function get_slug(): string {
+		return 'scripts';
+	}
+
+	/**
+	 * Adds the action and filter hooks to integrate with WordPress.
+	 */
+	public function initialize(): void {
+		$this->js_uri = get_theme_file_uri( '/assets/js/' );
+		$this->js_dir = get_theme_file_path( '/assets/js/' );
+
+		add_action( 'wp_enqueue_scripts', array( $this, 'action_enqueue_scripts' ) );
+		add_action( 'wp_head', array( $this, 'action_print_bootloader' ), 1 );
+		add_filter( 'script_loader_tag', array( $this, 'filter_script_loader_tag' ), 10, 2 );
+	}
+
+	/**
+	 * Gets template tags to expose as methods on the Template_Tags class instance, accessible through `bonn_growmodo()`.
+	 *
+	 * @return array Associative array of $method_name => $callback_info pairs. Each $callback_info must either be
+	 *               a callable or an array with key 'callable'. This approach is used to reserve the possibility of
+	 *               adding support for further arguments in the future.
+	 */
+	public function template_tags(): array {
+		return array(
+			'print_scripts' => array( $this, 'print_scripts' ),
+		);
+	}
+
+	/**
+	 * Registers or enqueues JavaScript files.
+	 *
+	 * JavaScript files that are global are enqueued. All other JavaScript files are only registered, to be enqueued later.
+	 */
+	public function action_enqueue_scripts(): void {
+		$js_files = $this->get_js_files();
+		foreach ( $js_files as $handle => $data ) {
+			/*
+			 * Enqueue global JavaScript files immediately and register the other ones for later use.
+			 */
+			foreach ( $data['deps'] as $dep ) {
+				if ( ! wp_script_is( $dep, 'registered' ) ) {
+					wp_register_script( $dep, false, array(), $this->get_version(), true );
+				}
+			}
+
+			if ( $data['global'] ) {
+				wp_enqueue_script( $handle, $data['src'], $data['deps'], $data['version'], $data['footer'] );
+			} else {
+				wp_register_script( $handle, $data['src'], $data['deps'], $data['version'], $data['footer'] );
+			}
+
+			/**
+			 * Set async and deferred attributes.
+			 */
+			if ( 'async' === $data['loading'] || 'async' === ( $data['strategy'] ?? '' ) ) {
+				wp_script_add_data( $handle, 'async', true );
+			}
+			if ( 'defer' === $data['loading'] || 'defer' === ( $data['strategy'] ?? '' ) ) {
+				wp_script_add_data( $handle, 'defer', true );
+			}
+
+			if ( 'delay' === ( $data['strategy'] ?? '' ) ) {
+				wp_script_add_data( $handle, 'rig-strategy', 'delay' );
+
+				// Mark dependencies for delay if they are not already enqueued/loaded.
+				if ( ! empty( $data['deps'] ) ) {
+					foreach ( $data['deps'] as $dep ) {
+						wp_script_add_data( $dep, 'rig-strategy', 'delay' );
+					}
+				}
+			}
+
+			/**
+			 *  Uses wp_localize_scripts
+			 */
+			if ( $data['localize'] ) {
+				foreach ( $data['localize'] as $object => $vars ) {
+					wp_localize_script( $handle, $object, $vars );
+				}
+			}
+		}
+	}
+
+
+
+	/**
+	 * Filters the script tag to implement the delayed loading strategy.
+	 *
+	 * @param string $tag    The script tag.
+	 * @param string $handle The script handle.
+	 * @return string Modified script tag.
+	 */
+	public function filter_script_loader_tag( string $tag, string $handle ): string {
+		$strategy = wp_scripts()->get_data( $handle, 'rig-strategy' );
+		if ( 'delay' === $strategy ) {
+			$tag = str_replace( ' src=', ' data-src=', $tag );
+			$tag = str_replace( '<script ', '<script data-rig-strategy="delay" ', $tag );
+		}
+		return $tag;
+	}
+
+	/**
+	 * Prints the bootloader snippet for the interaction-delayed loader.
+	 */
+	public function action_print_bootloader(): void {
+		?>
+		<script id="bonn-growmodo-interaction-loader">
+		(function(){var e=["touchstart","mousemove","scroll","keydown","click"],t=function(){e.forEach(function(e){window.removeEventListener(e,t)}),document.querySelectorAll('script[data-rig-strategy="delay"]').forEach(function(e){e.src=e.getAttribute("data-src"),e.removeAttribute("data-src"),e.removeAttribute("data-rig-strategy")})};e.forEach(function(e){window.addEventListener(e,t,{passive:!0,once:!0})})})();
+		</script>
+		<?php
+	}
+
+	/**
+	 * Prints JavaScript <script> tags directly.
+	 *
+	 * This should be used for JavaScript files that aren't global and thus should only be loaded if the HTML markup
+	 * they are responsible for is actually present. Template parts should use this method when the related markup
+	 * requires a specific JavaScript file to be loaded. If preloading JavaScript files is disabled, this method will not do
+	 * anything.
+	 *
+	 * If the `<script>` tag for a given JavaScript file has already been printed, it will be skipped.
+	 *
+	 * @param string ...$handles One or more JavaScript file handles.
+	 */
+	public function print_scripts( string ...$handles ): void {
+
+		$js_files = $this->get_js_files();
+		$handles  = array_filter(
+			$handles,
+			function ( $handle ) use ( $js_files ) {
+				$is_valid = isset( $js_files[ $handle ] ) && ! $js_files[ $handle ]['global'];
+				if ( ! $is_valid ) {
+					/* translators: %s: JS handle */
+					_doing_it_wrong( __CLASS__ . '::print_scripts()', esc_html( sprintf( __( 'Invalid theme JS handle: %s', 'bonn-growmodo' ), $handle ) ), 'Bonn GrowModo 2.0.0' );
+				}
+				return $is_valid;
+			}
+		);
+
+		if ( array() === $handles ) {
+			return;
+		}
+
+		wp_print_scripts( $handles );
+	}
+
+	/**
+	 * Gets all JS files.
+	 *
+	 * @return array Associative array of $handle => $data pairs.
+	 */
+	protected function get_js_files(): array {
+		if ( is_array( $this->js_files ) ) {
+			return $this->js_files;
+		}
+
+		$js_files = array(
+			'bonn-growmodo-global' => array(
+				'file'   => 'global.min.js',
+				'global' => true,
+			),
+		);
+
+		// Aggregate manifests from components implementing Asset_Provider.
+		$js_files = array_merge( $js_files, bonn_growmodo_theme()->get_asset_manifests( 'scripts' ) );
+
+		/**
+		 * Filters default JS files.
+		 *
+		 * @param array $js_files Associative array of JS files, as $handle => $data pairs.
+		 *                         $data must be an array with keys 'file' (file path relative to 'assets/js'
+		 *                         directory), and optionally 'global' (whether the file should immediately be
+		 *                         enqueued instead of just being registered) and 'preload_callback' (callback)
+		 *                         function determining whether the file should be preloaded for the current request).
+		 */
+		$js_files = apply_filters( 'bonn_growmodo_js_files', $js_files );
+
+		$this->js_files = array();
+		foreach ( $js_files as $handle => $data ) {
+			if ( is_string( $data ) ) {
+				$data = array( 'file' => $data );
+			}
+
+			if ( empty( $data['file'] ) ) {
+				continue;
+			}
+
+			$this->js_files[ $handle ] = array_merge(
+				array(
+					'global'    => false,
+					'strategy'  => null,
+					'loading'   => null,
+					'condition' => null,
+					'footer'    => false,
+					'deps'      => array(),
+					'localize'  => null,
+				),
+				$data
+			);
+
+			$file = bonn_growmodo()->get_asset_file( $this->js_files[ $handle ]['file'], 'script' );
+
+			$this->js_files[ $handle ]['file']    = $file;
+			$this->js_files[ $handle ]['src']     = $this->js_uri . $file;
+			$this->js_files[ $handle ]['path']    = $this->js_dir . $file;
+			$this->js_files[ $handle ]['version'] = bonn_growmodo()->get_asset_version( $this->js_dir . $file );
+		}
+
+		return $this->js_files;
+	}
+}
